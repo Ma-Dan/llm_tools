@@ -267,27 +267,32 @@ def convert_to_tool_calls_format(original_response: Dict[str, Any]) -> Dict[str,
     return response
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
+async def chat_completions(request: Request):
     """
     处理聊天完成请求，调用真实服务并转换为tool_calls格式
     """
     try:
+        auth_header = request.headers.get("Authorization", "")
+
+        req_data = await request.json()
+
         # 准备消息列表
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        messages = req_data.get("messages", [])
+        model = req_data.get("model", "deepseek-chat")
 
         # 从请求中获取工具定义，如果没有则使用空列表
-        request_tools = request.tools if request.tools else []
+        request_tools = req_data.get("tools", [])
 
         # 调用真实的不支持tool_call的服务
         # 使用simulate_tools_call函数，但注意它会自动添加system prompt
         final_response = simulate_tools_call(
             api_url=TARGET_API_URL,
-            authorization=authorization,
-            model=request.model,
+            authorization=auth_header,
+            model=model,
             messages=messages,
             tools=request_tools,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens
+            temperature=req_data.get("temperature", 0.8),
+            max_tokens=req_data.get("max_tokens", 500),
         )
 
         # 转换为tool_calls格式
