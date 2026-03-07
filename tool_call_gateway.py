@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+工具调用转换网关
+使用 FastAPI 将不支持 tool_call 的服务转换为支持 tool_calls 格式的响应
+"""
+
+import json
+import requests
+import uuid
+import importlib.util
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+
+app = FastAPI(title="Tool Call Gateway", description="将不支持tool_call的服务转换为tool_calls格式")
+
+# 目标服务的URL（不支持tool_call的真实服务）
+TARGET_API_URL = "http://127.0.0.1:5001/v1/chat/completions"
+
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    tools: Optional[List[Dict[str, Any]]] = None
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = 500
+
+# ===================== 核心模拟函数 =====================
+
+def simulate_tools_call(
+    api_url: str,
+    authorization: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    tools: List[Dict[str, Any]],
+    **kwargs
+) -> Dict[str, Any]:
+    """
+    使用 requests 模拟 tools 调用，支持多轮工具调用循环。
+
+    参数：
+        api_url: API 端点地址，例如 "https://api.openai.com/v1/chat/completions"
+        api_key: API 密钥
+        model: 模型名称
+        messages: 对话历史列表，格式同 OpenAI
+        tools: 工具定义列表，格式同 OpenAI 的 tools 参数
+        **kwargs: 其他传递给 API 的参数，如 temperature, max_tokens 等
+
+    返回：
+        最终模型的响应（字典格式），包含最终的助手消息。
+    """
+    # 1. 将 tools 定义转换成自然语言提示
+    tools_description = "\n\n".join([
+        f"工具 {i+1}：\n名称：{tool['function']['name']}\n描述：{tool['function']['description']}\n"
+        f"参数 JSON Schema：{json.dumps(tool['function']['parameters'], ensure_ascii=False)}"
+        for i, tool in enumerate(tools)
+    ])
+
+    system_prompt = (
+        "你是一个可以调用外部工具的助手。当需要获取实时信息或执行特定操作时，请输出一个 JSON 对象表示要调用的工具。"
+        "可用的工具如下：\n" + tools_description + "\n"
+        "输出格式必须严格为：{\"tool\": \"工具名称\", \"arguments\": {参数对象}}。"
+        "如果不需要调用工具，请直接给出普通回答。"
+    )
+
+    if len(tools) == 0:
+        system_prompt = ''
+
+    # 构建消息列表：确保 system prompt 存在
+    new_messages = []
+    system_exists = False
+    for msg in messages:
+        if msg["role"] == "system":
+            # 合并到系统提示
+            new_messages.append({"role": "system", "content": msg["content"] + system_prompt})
+            system_exists = True
+        else:
+            new_messages.append(msg)
+    if not system_exists:
+        new_messages.insert(0, {"role": "system", "content": system_prompt})
+
+    # 请求头
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": authorization
+    }
+
+    # 2. 调用模型
+    payload = {
+        "model": model,
+        "messages": new_messages,
+        **kwargs
+    }
+    response = requests.post(api_url, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise Exception(f"API 请求失败，状态码 {response.status_code}：{response.text}")
+
+    result = response.json()
+
+    return result
+
+def parse_tool_call_from_content(content: str) -> Optional[Dict[str, Any]]:
+    """
+    从模型返回的content中解析工具调用
+    simulate_tool_call.py期望的格式是: {"tool": "工具名称", "arguments": {参数对象}}
+    """
+    # 如果内容包含 "FINISHED"，先移除它
+    cleaned_content = content
+    if "FINISHED" in cleaned_content:
+        cleaned_content = cleaned_content.replace("FINISHED", "").strip()
+        # 如果移除后为空，返回None
+        if not cleaned_content:
+            return None
+
+    try:
+        # 尝试直接解析JSON
+        parsed = json.loads(cleaned_content)
+        if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 尝试从文本中提取JSON
+    import re
+    # 改进的正则表达式，可以匹配包含tool和arguments字段的JSON对象
+    json_pattern = r'({[^{}]*"tool"[^{}]*"arguments"[^{}]*})'
+    match = re.search(json_pattern, cleaned_content, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 如果上述匹配失败，尝试更宽松的匹配模式
+    try:
+        # 查找以{开头，以}结尾的字符串
+        import re
+        json_objects = re.findall(r'\{.*?\}', cleaned_content, re.DOTALL)
+        for obj in json_objects:
+            try:
+                parsed = json.loads(obj)
+                if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
+    except Exception:
+        pass
+
+    return None
+
+def convert_to_tool_calls_format(original_response: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    将原始响应转换为tool_calls格式
+    """
+    # 获取原始消息内容
+    choice = original_response.get("choices", [{}])[0]
+    message = choice.get("message", {})
+    content = message.get("content", "")
+
+    # 生成工具调用ID
+    tool_call_id = f"chatcmpl-tool-{uuid.uuid4().hex[:16]}"
+
+    # 尝试从内容中解析工具调用
+    tool_call_data = parse_tool_call_from_content(content)
+
+    if tool_call_data:
+        # 构建tool_calls响应
+        tool_calls = [
+            {
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": tool_call_data["tool"],
+                    "arguments": json.dumps(tool_call_data["arguments"], ensure_ascii=False)
+                }
+            }
+        ]
+
+        # 提取think标签内容（如果存在）
+        think_content = ""
+        import re
+        think_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL)
+        if think_match:
+            think_content = think_match.group(1).strip()
+
+        # 构建新的消息内容
+        if think_content:
+            new_content = f"<think>\n{think_content}\n</think>\n\n"
+        else:
+            new_content = content
+
+        # 构建响应
+        response = {
+            "id": original_response.get("id", f"chatcmpl-{uuid.uuid4().hex}"),
+            "object": "chat.completion",
+            "created": original_response.get("created", 1677652288),
+            "model": original_response.get("model", "deepseek-chat"),
+            "system_fingerprint": original_response.get("system_fingerprint", "fp_44709d6fcb"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": new_content,
+                        "refusal": None,
+                        "annotations": None,
+                        "audio": None,
+                        "function_call": None,
+                        "tool_calls": tool_calls,
+                        "reasoning": None,
+                        "reasoning_content": None
+                    },
+                    "logprobs": None,
+                    "finish_reason": "tool_calls"
+                }
+            ],
+            "usage": original_response.get("usage", {
+                "prompt_tokens": 100,
+                "completion_tokens": 150,
+                "total_tokens": 250
+            })
+        }
+    else:
+        # 没有工具调用，返回普通响应
+        response = {
+            "id": original_response.get("id", f"chatcmpl-{uuid.uuid4().hex}"),
+            "object": "chat.completion",
+            "created": original_response.get("created", 1677652288),
+            "model": original_response.get("model", "deepseek-chat"),
+            "system_fingerprint": original_response.get("system_fingerprint", "fp_44709d6fcb"),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "refusal": None,
+                        "annotations": None,
+                        "audio": None,
+                        "function_call": None,
+                        "tool_calls": None,
+                        "reasoning": None,
+                        "reasoning_content": None
+                    },
+                    "logprobs": None,
+                    "finish_reason": choice.get("finish_reason", "stop")
+                }
+            ],
+            "usage": original_response.get("usage", {
+                "prompt_tokens": 100,
+                "completion_tokens": 150,
+                "total_tokens": 250
+            })
+        }
+
+    return response
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
+    """
+    处理聊天完成请求，调用真实服务并转换为tool_calls格式
+    """
+    try:
+        # 准备消息列表
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+
+        # 从请求中获取工具定义，如果没有则使用空列表
+        request_tools = request.tools if request.tools else []
+
+        # 调用真实的不支持tool_call的服务
+        # 使用simulate_tools_call函数，但注意它会自动添加system prompt
+        final_response = simulate_tools_call(
+            api_url=TARGET_API_URL,
+            authorization=authorization,
+            model=request.model,
+            messages=messages,
+            tools=request_tools,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        )
+
+        # 转换为tool_calls格式
+        converted_response = convert_to_tool_calls_format(final_response)
+
+        return JSONResponse(content=converted_response)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """健康检查端点"""
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=5002)
