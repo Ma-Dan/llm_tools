@@ -10,9 +10,9 @@ import json
 import requests
 import uuid
 import importlib.util
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -33,6 +33,7 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 500
+    stream: Optional[bool] = False
 
 # ===================== 核心模拟函数 =====================
 
@@ -266,15 +267,116 @@ def convert_to_tool_calls_format(original_response: Dict[str, Any]) -> Dict[str,
 
     return response
 
+async def generate_streaming_response(original_response: Dict[str, Any]) -> AsyncGenerator[str, None]:
+    """
+    生成流式响应
+    """
+    # 转换为tool_calls格式
+    converted = convert_to_tool_calls_format(original_response)
+
+    # 获取内容
+    content = converted["choices"][0]["message"]["content"]
+    tool_calls = converted["choices"][0]["message"].get("tool_calls")
+
+    # 生成第一个chunk：角色信息
+    first_chunk = {
+        "id": converted["id"],
+        "object": "chat.completion.chunk",
+        "created": converted["created"],
+        "model": converted["model"],
+        "system_fingerprint": converted["system_fingerprint"],
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": ""
+                },
+                "logprobs": None,
+                "finish_reason": None
+            }
+        ]
+    }
+    yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+
+    # 分块发送内容
+    if content:
+        # 按字符分块发送，模拟流式效果
+        chunk_size = 5  # 每块5个字符
+        for i in range(0, len(content), chunk_size):
+            chunk_content = content[i:i+chunk_size]
+            chunk = {
+                "id": converted["id"],
+                "object": "chat.completion.chunk",
+                "created": converted["created"],
+                "model": converted["model"],
+                "system_fingerprint": converted["system_fingerprint"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": chunk_content
+                        },
+                        "logprobs": None,
+                        "finish_reason": None
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+    # 如果有工具调用，发送工具调用信息
+    if tool_calls:
+        tool_chunk = {
+            "id": converted["id"],
+            "object": "chat.completion.chunk",
+            "created": converted["created"],
+            "model": converted["model"],
+            "system_fingerprint": converted["system_fingerprint"],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": tool_calls
+                    },
+                    "logprobs": None,
+                    "finish_reason": "tool_calls"
+                }
+            ]
+        }
+        yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n"
+    else:
+        # 发送完成chunk
+        final_chunk = {
+            "id": converted["id"],
+            "object": "chat.completion.chunk",
+            "created": converted["created"],
+            "model": converted["model"],
+            "system_fingerprint": converted["system_fingerprint"],
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "logprobs": None,
+                    "finish_reason": converted["choices"][0].get("finish_reason", "stop")
+                }
+            ]
+        }
+        yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+
+    # 发送结束标记
+    yield "data: [DONE]\n\n"
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
     处理聊天完成请求，调用真实服务并转换为tool_calls格式
+    支持流式和非流式响应
     """
     try:
         auth_header = request.headers.get("Authorization", "")
 
         req_data = await request.json()
+        stream = req_data.get("stream", False)
 
         # 准备消息列表
         messages = req_data.get("messages", [])
@@ -284,7 +386,6 @@ async def chat_completions(request: Request):
         request_tools = req_data.get("tools", [])
 
         # 调用真实的不支持tool_call的服务
-        # 使用simulate_tools_call函数，但注意它会自动添加system prompt
         final_response = simulate_tools_call(
             api_url=TARGET_API_URL,
             authorization=auth_header,
@@ -295,10 +396,16 @@ async def chat_completions(request: Request):
             max_tokens=req_data.get("max_tokens", 500),
         )
 
-        # 转换为tool_calls格式
-        converted_response = convert_to_tool_calls_format(final_response)
-
-        return JSONResponse(content=converted_response)
+        if stream:
+            # 返回流式响应
+            return StreamingResponse(
+                generate_streaming_response(final_response),
+                media_type="text/event-stream"
+            )
+        else:
+            # 返回非流式响应
+            converted_response = convert_to_tool_calls_format(final_response)
+            return JSONResponse(content=converted_response)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
