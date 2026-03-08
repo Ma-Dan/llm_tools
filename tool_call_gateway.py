@@ -115,17 +115,10 @@ def parse_tool_call_from_content(content: str) -> Optional[Dict[str, Any]]:
     从模型返回的content中解析工具调用
     simulate_tool_call.py期望的格式是: {"tool": "工具名称", "arguments": {参数对象}}
     """
-    # 如果内容包含 "FINISHED"，先移除它
-    cleaned_content = content
-    if "FINISHED" in cleaned_content:
-        cleaned_content = cleaned_content.replace("FINISHED", "").strip()
-        # 如果移除后为空，返回None
-        if not cleaned_content:
-            return None
 
     try:
         # 尝试直接解析JSON
-        parsed = json.loads(cleaned_content)
+        parsed = json.loads(content)
         if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
             return parsed
     except (json.JSONDecodeError, TypeError):
@@ -137,7 +130,7 @@ def parse_tool_call_from_content(content: str) -> Optional[Dict[str, Any]]:
     # 首先尝试匹配整个JSON对象（包括嵌套的花括号）
     # 使用平衡括号匹配的正则表达式
     json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
-    json_objects = re.findall(json_pattern, cleaned_content, re.DOTALL)
+    json_objects = re.findall(json_pattern, content, re.DOTALL)
 
     for obj in json_objects:
         try:
@@ -152,7 +145,7 @@ def parse_tool_call_from_content(content: str) -> Optional[Dict[str, Any]]:
     import re
     # 查找包含 "tool" 的 JSON 对象
     tool_pattern = r'\{[^{}]*"tool"[^{}]*\}'
-    match = re.search(tool_pattern, cleaned_content, re.DOTALL)
+    match = re.search(tool_pattern, content, re.DOTALL)
     if match:
         try:
             parsed = json.loads(match.group(0))
@@ -177,6 +170,10 @@ def convert_to_tool_calls_format(original_response: Dict[str, Any]) -> Dict[str,
 
     # 生成工具调用ID
     tool_call_id = f"chatcmpl-tool-{uuid.uuid4().hex[:16]}"
+
+    # 如果结尾包含 "FINISHED" 那么移除
+    if content[-8:] == "FINISHED":
+        content = content[:-8]
 
     # 尝试从内容中解析工具调用
     tool_call_data = parse_tool_call_from_content(content)
