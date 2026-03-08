@@ -67,9 +67,10 @@ def simulate_tools_call(
     ])
 
     system_prompt = (
-        "你是一个可以调用外部工具的助手。当需要获取实时信息或执行特定操作时，请输出一个 JSON 对象表示要调用的工具。"
+        "\n你是一个可以调用外部工具的助手。当需要获取实时信息或执行特定操作时，请输出一个 JSON 对象表示要调用的工具。"
         "可用的工具如下：\n" + tools_description + "\n"
         "输出格式必须严格为：{\"tool\": \"工具名称\", \"arguments\": {参数对象}}。"
+        "**重要提示：请判断用户的问题，是否需要调用工具，如果需要调用工具，聪明的选择对应的工具，并使用以上格式输出。**"
         "如果不需要调用工具，请直接给出普通回答。"
     )
 
@@ -130,33 +131,38 @@ def parse_tool_call_from_content(content: str) -> Optional[Dict[str, Any]]:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # 尝试从文本中提取JSON
+    # 尝试从文本中提取JSON - 改进的正则表达式，可以处理嵌套的花括号
     import re
-    # 改进的正则表达式，可以匹配包含tool和arguments字段的JSON对象
-    json_pattern = r'({[^{}]*"tool"[^{}]*"arguments"[^{}]*})'
-    match = re.search(json_pattern, cleaned_content, re.DOTALL)
-    if match:
+
+    # 首先尝试匹配整个JSON对象（包括嵌套的花括号）
+    # 使用平衡括号匹配的正则表达式
+    json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
+    json_objects = re.findall(json_pattern, cleaned_content, re.DOTALL)
+
+    for obj in json_objects:
         try:
-            parsed = json.loads(match.group(1))
+            parsed = json.loads(obj)
             if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
                 return parsed
         except (json.JSONDecodeError, TypeError):
-            pass
+            continue
 
-    # 如果上述匹配失败，尝试更宽松的匹配模式
-    try:
-        # 查找以{开头，以}结尾的字符串
-        import re
-        json_objects = re.findall(r'\{.*?\}', cleaned_content, re.DOTALL)
-        for obj in json_objects:
-            try:
-                parsed = json.loads(obj)
-                if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
-                    return parsed
-            except (json.JSONDecodeError, TypeError):
-                continue
-    except Exception:
-        pass
+    # 如果上面的方法失败，尝试用更简单的方法：在文本中查找可能包含tool的JSON
+    # 查找包含 "tool" 的 JSON 对象
+    import re
+    # 查找包含 "tool" 的 JSON 对象
+    tool_pattern = r'\{[^{}]*"tool"[^{}]*\}'
+    match = re.search(tool_pattern, cleaned_content, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict) and "tool" in parsed:
+                # 检查是否有arguments，如果没有则使用空对象
+                if "arguments" not in parsed:
+                    parsed["arguments"] = {}
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     return None
 
